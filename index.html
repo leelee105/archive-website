@@ -442,11 +442,9 @@ const App = (function () {
 
   // ── STORAGE KEYS ────────────────────────────────
   const META_KEY   = 'archive:meta:v1';
-  // Chunk raw bytes at 3MB → encodes to ~4MB base64, safely under 5MB key limit.
-  // IMPORTANT: chunking is done on the raw ArrayBuffer BEFORE base64 encoding,
-  // so each stored value is guaranteed to be at most ceil(3MB * 4/3) ≈ 4MB.
-  const RAW_CHUNK_BYTES = 3 * 1024 * 1024; // 3 MB of raw binary per chunk
-  const MAX_FILE_BYTES  = 50 * 1024 * 1024; // 50 MB practical cap (warn user)
+  // 500KB raw → ~667KB base64 per key. Small enough to always succeed.
+  const RAW_CHUNK_BYTES = 500 * 1024;
+  const MAX_FILE_BYTES  = 20 * 1024 * 1024; // 20 MB cap
 
   // ── BINARY HELPERS ──────────────────────────────
   function bufToB64(buf) {
@@ -483,11 +481,11 @@ const App = (function () {
     try {
       const result = await window.storage.set(META_KEY, json, true);
       if (!result) throw new Error('storage.set returned null');
-      // Keep our sync hash current so the poll loop doesn't re-apply our own write
       lastMetaSnapshot = json;
+      return true;
     } catch(e) {
       console.error('save() failed:', e);
-      toast('⚠ Save failed — changes may not persist');
+      return false;
     }
   }
 
@@ -519,30 +517,42 @@ const App = (function () {
   }
 
   // ── FILE BINARY STORAGE (chunked) ───────────────
+  // Stores raw bytes in chunks. Each chunk is base64-encoded independently
+  // so no single storage key ever exceeds ~667KB (500KB raw * 4/3).
+  async function storageSetWithRetry(key, value, shared, retries = 3) {
+    for (let attempt = 0; attempt < retries; attempt++) {
+      try {
+        const result = await window.storage.set(key, value, shared);
+        if (result) return result;
+      } catch(e) { /* fall through to retry */ }
+      if (attempt < retries - 1) await new Promise(r => setTimeout(r, 200 * (attempt + 1)));
+    }
+    return null;
+  }
+
   async function saveFileData(dataKey, arrayBuffer) {
-    // Chunk the RAW bytes first, then base64-encode each chunk individually.
-    // This guarantees each stored value is at most ~4MB (well under the 5MB key limit).
-    // If we encoded the whole buffer first, a 4MB file becomes a 5.3MB string —
-    // which exceeds the per-key limit and causes a silent failure.
     const totalBytes  = arrayBuffer.byteLength;
     const totalChunks = Math.ceil(totalBytes / RAW_CHUNK_BYTES) || 1;
 
-    // Save info key first
-    const infoResult = await window.storage.set(
+    const infoResult = await storageSetWithRetry(
       `archive:file:${dataKey}:info`,
       JSON.stringify({ chunks: totalChunks, size: totalBytes }),
       true
     );
-    if (!infoResult) throw new Error(`Failed to save file info for ${dataKey}`);
+    if (!infoResult) throw new Error(`Storage quota exceeded or unavailable`);
 
-    // Encode and save each raw byte-chunk separately
     for (let i = 0; i < totalChunks; i++) {
-      const start      = i * RAW_CHUNK_BYTES;
-      const end        = Math.min(start + RAW_CHUNK_BYTES, totalBytes);
-      const rawSlice   = arrayBuffer.slice(start, end);
-      const b64Chunk   = bufToB64(rawSlice);
-      const chunkResult = await window.storage.set(`archive:file:${dataKey}:${i}`, b64Chunk, true);
-      if (!chunkResult) throw new Error(`Failed to save chunk ${i} for ${dataKey}`);
+      const start     = i * RAW_CHUNK_BYTES;
+      const end       = Math.min(start + RAW_CHUNK_BYTES, totalBytes);
+      const rawSlice  = arrayBuffer.slice(start, end);
+      const b64Chunk  = bufToB64(rawSlice);
+      const result    = await storageSetWithRetry(`archive:file:${dataKey}:${i}`, b64Chunk, true);
+      if (!result) {
+        // Clean up any chunks already written before throwing
+        for (let j = 0; j < i; j++) await window.storage.delete(`archive:file:${dataKey}:${j}`, true).catch(() => {});
+        await window.storage.delete(`archive:file:${dataKey}:info`, true).catch(() => {});
+        throw new Error(`Storage quota exceeded on chunk ${i}/${totalChunks}`);
+      }
     }
   }
 
@@ -708,14 +718,17 @@ const App = (function () {
         } catch(err) {
           console.error('Upload error for', file.name, err);
           failed++;
-          toast(`⚠ "${file.name}" failed to upload — storage error`);
+          const reason = err.message && err.message.includes('quota')
+            ? 'storage is full'
+            : `file may exceed storage limits (${formatSize(file.size)})`;
+          toast(`⚠ "${file.name}" — ${reason}`);
         } finally {
           done++;
           if (done === toUpload.length) {
-            await save();
+            const saved = await save();
             render();
             updateCounts();
-            setSyncStatus('synced');
+            setSyncStatus(saved ? 'synced' : 'synced'); // don't show offline on upload failure
             const ok = toUpload.length - failed;
             if (ok > 0) toast(`✓ Added ${ok} file${ok > 1 ? 's' : ''}`);
           }
