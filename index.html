@@ -881,6 +881,7 @@
       <span><span class="s-dot"></span>ARCHIVE</span>
       <span id="sbCount">0 items</span>
       <span id="sbSize">0 B</span>
+      <span id="syncStatus" style="margin-left:auto;font-size:0.6875rem;color:var(--mid);">⟳ Connecting…</span>
     </div>
   </div>
 </div>
@@ -939,7 +940,6 @@
 
 <script>
 const App = (function () {
-  const STORE_KEY = 'archive_v2';
 
   function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
 
@@ -951,107 +951,163 @@ const App = (function () {
   let sortBy = 'name';
   let moveSelected = undefined; // undefined = not picked, null = root
 
-  // ── STORAGE ─────────────────────────────────────
-  // ── INDEXEDDB STORAGE ───────────────────────────
-  // Stores raw ArrayBuffers — no 5MB localStorage limit, works for
-  // unitypackage, exe, iso and any other large binary file.
-  const DB_NAME = 'archive_db';
-  const DB_VER  = 1;
-  const META_STORE = 'meta';
-  const FILE_STORE = 'files';
-  let db = null;
+  // ── SHARED STORAGE ──────────────────────────────
+  // Uses window.storage with shared:true so ALL users see the same files.
+  // Metadata (folders + file list) stored as JSON under one key.
+  // File binary data stored as base64 strings, chunked at 3MB each
+  // to stay under the 5MB-per-key limit.
+  const META_KEY   = 'archive:meta:v1';
+  const CHUNK_SIZE = 3 * 1024 * 1024; // 3MB per chunk (base64 ~4MB stored)
 
-  function openDB() {
-    return new Promise((resolve, reject) => {
-      if (db) return resolve(db);
-      const req = indexedDB.open(DB_NAME, DB_VER);
-      req.onupgradeneeded = e => {
-        const d = e.target.result;
-        if (!d.objectStoreNames.contains(META_STORE)) d.createObjectStore(META_STORE);
-        if (!d.objectStoreNames.contains(FILE_STORE)) d.createObjectStore(FILE_STORE);
-      };
-      req.onsuccess = e => { db = e.target.result; resolve(db); };
-      req.onerror   = e => reject(e.target.error);
-    });
+  // Convert ArrayBuffer → base64 string
+  function bufToB64(buf) {
+    let bin = '';
+    const bytes = new Uint8Array(buf);
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
   }
 
-  function idbPut(storeName, key, value) {
-    return openDB().then(d => new Promise((resolve, reject) => {
-      const tx = d.transaction(storeName, 'readwrite');
-      const req = tx.objectStore(storeName).put(value, key);
-      req.onsuccess = () => resolve();
-      req.onerror   = e => reject(e.target.error);
-    }));
+  // Convert base64 string → ArrayBuffer
+  function b64ToBuf(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes.buffer;
   }
 
-  function idbGet(storeName, key) {
-    return openDB().then(d => new Promise((resolve, reject) => {
-      const tx = d.transaction(storeName, 'readonly');
-      const req = tx.objectStore(storeName).get(key);
-      req.onsuccess = e => resolve(e.target.result);
-      req.onerror   = e => reject(e.target.error);
-    }));
-  }
-
-  function idbDelete(storeName, key) {
-    return openDB().then(d => new Promise((resolve, reject) => {
-      const tx = d.transaction(storeName, 'readwrite');
-      const req = tx.objectStore(storeName).delete(key);
-      req.onsuccess = () => resolve();
-      req.onerror   = e => reject(e.target.error);
-    }));
-  }
-
-  // Metadata (folders/files list) — stored as JSON in IDB meta store
-  function save() {
+  // Save metadata (folders + file list) to shared storage
+  async function save() {
     const meta = {
       folders: state.folders,
       files: state.files.map(f => ({
         id: f.id, name: f.name, size: f.size,
-        type: f.type, ext: f.ext, folderId: f.folderId,
-        dateAdded: f.dateAdded, dataKey: f.dataKey
+        type: f.type, ext: f.ext, mime: f.mime || '',
+        folderId: f.folderId, dateAdded: f.dateAdded, dataKey: f.dataKey
       }))
     };
-    idbPut(META_STORE, STORE_KEY, JSON.stringify(meta)).catch(() => {
-      // Fallback to localStorage for metadata only (tiny JSON, always fits)
-      try { localStorage.setItem(STORE_KEY, JSON.stringify(meta)); } catch(e) {}
-    });
+    try {
+      await window.storage.set(META_KEY, JSON.stringify(meta), true);
+    } catch(e) {
+      console.error('Failed to save metadata:', e);
+    }
   }
 
-  function load() {
-    // Returns a promise — caller must await before rendering
-    return openDB()
-      .then(() => idbGet(META_STORE, STORE_KEY))
-      .then(raw => {
-        if (!raw) {
-          // Try migrating from old localStorage data
-          const ls = localStorage.getItem(STORE_KEY);
-          if (ls) raw = ls;
-        }
-        if (!raw) return;
-        const p = JSON.parse(raw);
+  // Load metadata from shared storage
+  async function load() {
+    try {
+      const result = await window.storage.get(META_KEY, true);
+      if (result && result.value) {
+        const p = JSON.parse(result.value);
         state.folders = p.folders || [];
         state.files   = p.files   || [];
-      })
-      .catch(() => {
-        try {
-          const ls = localStorage.getItem(STORE_KEY);
-          if (ls) { const p = JSON.parse(ls); state.folders = p.folders||[]; state.files = p.files||[]; }
-        } catch(e) {}
-      });
+      }
+    } catch(e) {
+      console.error('Failed to load metadata:', e);
+    }
   }
 
-  // File binary data — stored as ArrayBuffer in IDB file store
-  function saveFileData(key, arrayBuffer) {
-    return idbPut(FILE_STORE, key, arrayBuffer);
+  // Save file binary data to shared storage (chunked for large files)
+  async function saveFileData(dataKey, arrayBuffer) {
+    const b64 = bufToB64(arrayBuffer);
+    const totalChunks = Math.ceil(b64.length / CHUNK_SIZE);
+    // Store chunk count first
+    await window.storage.set(`archive:file:${dataKey}:info`,
+      JSON.stringify({ chunks: totalChunks, size: arrayBuffer.byteLength }), true);
+    // Store each chunk
+    for (let i = 0; i < totalChunks; i++) {
+      const chunk = b64.slice(i * CHUNK_SIZE, (i + 1) * CHUNK_SIZE);
+      await window.storage.set(`archive:file:${dataKey}:${i}`, chunk, true);
+    }
   }
 
-  function getFileData(key) {
-    return idbGet(FILE_STORE, key); // resolves with ArrayBuffer or undefined
+  // Read file binary data from shared storage (reassemble chunks)
+  async function getFileData(dataKey) {
+    try {
+      const infoRes = await window.storage.get(`archive:file:${dataKey}:info`, true);
+      if (!infoRes || !infoRes.value) return null;
+      const { chunks } = JSON.parse(infoRes.value);
+      let b64 = '';
+      for (let i = 0; i < chunks; i++) {
+        const chunkRes = await window.storage.get(`archive:file:${dataKey}:${i}`, true);
+        if (!chunkRes || !chunkRes.value) return null;
+        b64 += chunkRes.value;
+      }
+      return b64ToBuf(b64);
+    } catch(e) {
+      return null;
+    }
   }
 
-  function deleteFileData(key) {
-    return idbDelete(FILE_STORE, key);
+  // Delete file data chunks from shared storage
+  async function deleteFileData(dataKey) {
+    try {
+      const infoRes = await window.storage.get(`archive:file:${dataKey}:info`, true);
+      if (infoRes && infoRes.value) {
+        const { chunks } = JSON.parse(infoRes.value);
+        for (let i = 0; i < chunks; i++) {
+          await window.storage.delete(`archive:file:${dataKey}:${i}`, true);
+        }
+      }
+      await window.storage.delete(`archive:file:${dataKey}:info`, true);
+    } catch(e) {}
+  }
+
+  // ── LIVE SYNC ────────────────────────────────────
+  // Poll shared storage every 5 seconds and re-render if metadata changed.
+  let lastMetaHash = '';
+  let syncInterval = null;
+
+  function startSync() {
+    syncInterval = setInterval(async () => {
+      try {
+        const result = await window.storage.get(META_KEY, true);
+        const val = (result && result.value) || '';
+        if (val !== lastMetaHash) {
+          lastMetaHash = val;
+          if (val) {
+            const p = JSON.parse(val);
+            const incoming = { folders: p.folders || [], files: p.files || [] };
+            // Merge: add any files/folders we don't already have locally
+            let changed = false;
+            incoming.files.forEach(f => {
+              if (!state.files.find(x => x.id === f.id)) {
+                state.files.push(f);
+                changed = true;
+              }
+            });
+            incoming.folders.forEach(f => {
+              if (!state.folders.find(x => x.id === f.id)) {
+                state.folders.push(f);
+                changed = true;
+              }
+            });
+            // Also catch remote deletions
+            const remoteFileIds = new Set(incoming.files.map(f => f.id));
+            const remoteFldrIds = new Set(incoming.folders.map(f => f.id));
+            const before = state.files.length + state.folders.length;
+            state.files   = state.files.filter(f => remoteFileIds.has(f.id));
+            state.folders = state.folders.filter(f => remoteFldrIds.has(f.id));
+            if (state.files.length + state.folders.length !== before) changed = true;
+            if (changed) { render(); updateCounts(); setSyncStatus('synced'); }
+          }
+        }
+      } catch(e) {}
+    }, 5000);
+  }
+
+  function setSyncStatus(status) {
+    const el = document.getElementById('syncStatus');
+    if (!el) return;
+    if (status === 'syncing') {
+      el.textContent = '⟳ Syncing…';
+      el.style.color = 'var(--mid)';
+    } else if (status === 'synced') {
+      el.textContent = '✓ Live';
+      el.style.color = 'var(--green)';
+    } else if (status === 'error') {
+      el.textContent = '✕ Offline';
+      el.style.color = 'var(--red)';
+    }
   }
 
   // ── FILE HELPERS ────────────────────────────────
@@ -1130,41 +1186,48 @@ const App = (function () {
     const arr = Array.from(fileList);
     if (!arr.length) return;
     let done = 0;
+    setSyncStatus('syncing');
+    toast(`Uploading ${arr.length} file${arr.length > 1 ? 's' : ''}…`);
 
     arr.forEach(file => {
       const reader = new FileReader();
-      reader.onload = e => {
-        const ext  = getExt(file.name);
-        const type = classifyType(ext);
-        const dataKey = genId();
-        const entry = {
-          id: genId(), name: file.name, size: file.size,
-          type, ext,
-          mime: file.type || 'application/octet-stream',
-          folderId: filterType ? null : currentFolderId,
-          dateAdded: Date.now(), dataKey
-        };
+      reader.onload = async e => {
+        try {
+          const ext  = getExt(file.name);
+          const type = classifyType(ext);
+          const dataKey = genId();
+          const entry = {
+            id: genId(), name: file.name, size: file.size,
+            type, ext,
+            mime: file.type || 'application/octet-stream',
+            folderId: filterType ? null : currentFolderId,
+            dateAdded: Date.now(), dataKey
+          };
 
-        saveFileData(dataKey, e.target.result)
-          .then(() => {
-            // Pre-populate thumb cache for images so the thumbnail
-            // appears instantly on the next render without a second IDB read
-            if (type === 'image') {
-              const mime = file.type || getMimeByExt(ext) || 'image/jpeg';
-              const blob = new Blob([e.target.result], { type: mime });
-              thumbCache[dataKey] = URL.createObjectURL(blob);
-            }
-            state.files.push(entry);
-            if (++done === arr.length) {
-              save(); render(); updateCounts();
-              toast(`Added ${arr.length} file${arr.length > 1 ? 's' : ''}`);
-            }
-          })
-          .catch(err => {
-            console.error('Failed to save file data:', err);
-            toast(`Failed to store "${file.name}" — try a smaller file or clear storage`);
-            if (++done === arr.length) { save(); render(); updateCounts(); }
-          });
+          await saveFileData(dataKey, e.target.result);
+
+          // Pre-populate thumb cache for images
+          if (type === 'image') {
+            const mime = file.type || getMimeByExt(ext) || 'image/jpeg';
+            const blob = new Blob([e.target.result], { type: mime });
+            thumbCache[dataKey] = URL.createObjectURL(blob);
+          }
+
+          state.files.push(entry);
+          if (++done === arr.length) {
+            await save();
+            // Update the hash so sync loop doesn't double-render
+            const r = await window.storage.get(META_KEY, true).catch(() => null);
+            if (r) lastMetaHash = r.value || '';
+            render(); updateCounts();
+            setSyncStatus('synced');
+            toast(`Added ${arr.length} file${arr.length > 1 ? 's' : ''}`);
+          }
+        } catch(err) {
+          console.error('Upload error:', err);
+          toast(`Failed to store "${file.name}"`);
+          if (++done === arr.length) { await save(); render(); updateCounts(); setSyncStatus('error'); }
+        }
       };
       reader.onerror = () => {
         toast(`Failed to read "${file.name}"`);
@@ -1697,13 +1760,17 @@ const App = (function () {
     if (val === CORRECT_KEY) {
       sessionStorage.setItem(KEY_SESSION, '1');
       hideKeyGate();
-      // Now boot the actual app
-      load().then(() => render());
+      setSyncStatus('syncing');
+      load().then(() => {
+        render();
+        setSyncStatus('synced');
+        startSync();
+      });
     } else {
       errEl.textContent = 'Incorrect key — try again';
       const inp = document.getElementById('keyInput');
       inp.classList.remove('shake');
-      void inp.offsetWidth; // force reflow to restart animation
+      void inp.offsetWidth;
       inp.classList.add('shake');
       inp.value = '';
       setTimeout(() => { inp.classList.remove('shake'); errEl.textContent = ''; }, 1500);
@@ -1718,9 +1785,13 @@ const App = (function () {
   // ── DROP & KEYBOARD ─────────────────────────────
   function init() {
     if (isUnlocked()) {
-      // Already unlocked this session — go straight to app
       hideKeyGate();
-      load().then(() => render());
+      setSyncStatus('syncing');
+      load().then(() => {
+        render();
+        setSyncStatus('synced');
+        startSync();
+      });
     } else {
       showKeyGate();
     }
